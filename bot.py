@@ -11,7 +11,7 @@ from telegram.error import Conflict
 TOKEN = os.environ.get('BOT_TOKEN') or '7910806794:AAEJUGA9xhGuWnFUnGukfHSLP71JNSFfqX8'
 
 # ID администратора (ВАШ ID из Telegram)
-ADMIN_ID = 5763705344  # Замените на ваш настоящий ID
+ADMIN_ID = 5763705344 # Замените на ваш настоящий ID
 
 # Настройка логирования
 logging.basicConfig(
@@ -731,3 +731,4 @@ if __name__ == '__main__':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
     asyncio.run(main())
+
