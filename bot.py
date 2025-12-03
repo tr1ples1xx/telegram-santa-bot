@@ -2,12 +2,16 @@ import logging
 import os
 import sys
 import random
+import asyncio
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Conflict
 
 # Токен
 TOKEN = os.environ.get('BOT_TOKEN') or '7910806794:AAEJUGA9xhGuWnFUnGukfHSLP71JNSFfqX8'
+
+# ID администратора (ВАШ ID из Telegram)
+ADMIN_ID = 5763705344  # Замените на ваш настоящий ID
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,18 +25,19 @@ class SantaDatabase:
     def __init__(self):
         self.participants = {}  # user_id -> данные
         self.pairs = {}  # giver_id -> receiver_id
-        self.all_assigned = False  # Флаг полного распределения
+        self.distribution_done = False  # Распределение выполнено?
     
     def register(self, user_id, username, full_name, wish=None, not_wish=None):
         self.participants[user_id] = {
             'name': full_name,
             'wish': wish,
             'not_wish': not_wish,
-            'has_receiver': False,  # Есть ли у этого человека даритель
-            'is_giver': False       # Является ли дарителем кому-то
+            'username': username,
+            'has_receiver': False,
+            'is_giver': False,
+            'notified': False  # Получил ли уведомление о получателе
         }
         logger.info(f"Registered: {full_name}")
-        self.all_assigned = False  # Сброс распределения при новом участнике
         return True
     
     def is_registered(self, user_id):
@@ -44,10 +49,14 @@ class SantaDatabase:
             return (p['name'], p['wish'], p['not_wish'])
         return None
     
-    def ensure_all_assigned(self):
-        """Гарантирует полное распределение всех участников"""
-        if self.all_assigned:
-            return True
+    def can_distribute(self):
+        """Можно ли выполнить распределение?"""
+        return len(self.participants) >= 2 and not self.distribution_done
+    
+    def distribute_gifts(self):
+        """Распределить подарки между всеми участниками"""
+        if self.distribution_done:
+            return False
         
         participants_list = list(self.participants.keys())
         
@@ -56,30 +65,41 @@ class SantaDatabase:
         
         # Создаём случайную циклическую цепочку
         shuffled = participants_list.copy()
-        random.shuffle(shuffled)
         
-        # Создаём цикл: каждый дарит следующему
+        # Пытаемся создать хорошую цепочку (избегаем коротких циклов)
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            random.shuffle(shuffled)
+            
+            # Проверяем что никто не дарит сам себе
+            valid = True
+            for i in range(len(shuffled)):
+                if shuffled[i] == participants_list[i]:
+                    valid = False
+                    break
+            
+            if valid:
+                break
+        
+        # Создаём пары: каждый дарит следующему в списке
         self.pairs.clear()
         for i in range(len(shuffled)):
             giver = shuffled[i]
-            receiver = shuffled[(i + 1) % len(shuffled)]  # Замыкаем в цикл
+            receiver = shuffled[(i + 1) % len(shuffled)]  # Замыкаем цикл
             self.pairs[giver] = receiver
         
         # Обновляем статусы
         for user_id in self.participants:
             self.participants[user_id]['has_receiver'] = user_id in self.pairs.values()
             self.participants[user_id]['is_giver'] = user_id in self.pairs
+            self.participants[user_id]['notified'] = False
         
-        self.all_assigned = True
-        logger.info(f"Created distribution chain for {len(participants_list)} participants")
+        self.distribution_done = True
+        logger.info(f"Распределение выполнено для {len(participants_list)} участников")
         return True
     
-    def assign_receiver(self, giver_id):
-        """Получить назначенного получателя"""
-        # Гарантируем полное распределение
-        if not self.ensure_all_assigned():
-            return None
-        
+    def get_receiver_for_giver(self, giver_id):
+        """Получить получателя для дарителя"""
         if giver_id not in self.pairs:
             return None
         
@@ -91,41 +111,56 @@ class SantaDatabase:
         
         return (receiver_id, receiver['name'], receiver['wish'], receiver['not_wish'])
     
-    def get_assigned_receiver(self, giver_id):
-        """Получить уже назначенного получателя (для отображения)"""
-        if giver_id not in self.pairs:
-            return None
-        
-        receiver_id = self.pairs[giver_id]
-        receiver = self.participants.get(receiver_id)
-        
-        if not receiver:
-            return None
-        
-        return (receiver['name'], receiver['wish'], receiver['not_wish'])
+    def mark_as_notified(self, user_id):
+        """Пометить что пользователь получил уведомление"""
+        if user_id in self.participants:
+            self.participants[user_id]['notified'] = True
+    
+    def is_notified(self, user_id):
+        """Проверил ли пользователь своего получателя?"""
+        return self.participants.get(user_id, {}).get('notified', False)
     
     def reset_all(self):
+        """Полный сброс"""
+        self.participants.clear()
         self.pairs.clear()
-        self.all_assigned = False
-        for uid in self.participants:
-            self.participants[uid]['has_receiver'] = False
-            self.participants[uid]['is_giver'] = False
+        self.distribution_done = False
+        logger.info("Все данные сброшены")
         return True
     
     def get_all(self):
         return self.participants
     
     def get_stats(self):
-        """Статистика распределения"""
         total = len(self.participants)
-        with_receiver = sum(1 for p in self.participants.values() if p['has_receiver'])
-        is_giver = sum(1 for p in self.participants.values() if p['is_giver'])
+        notified = sum(1 for p in self.participants.values() if p['notified'])
         
         return {
             'total': total,
-            'with_receiver': with_receiver,
-            'is_giver': is_giver,
-            'all_assigned': self.all_assigned
+            'distributed': self.distribution_done,
+            'notified': notified,
+            'remaining': total - notified
+        }
+    
+    def get_pair_info(self, giver_id):
+        """Полная информация о паре (для администратора)"""
+        if giver_id not in self.pairs:
+            return None
+        
+        receiver_id = self.pairs[giver_id]
+        giver = self.participants.get(giver_id)
+        receiver = self.participants.get(receiver_id)
+        
+        if not giver or not receiver:
+            return None
+        
+        return {
+            'giver_name': giver['name'],
+            'giver_username': giver['username'],
+            'receiver_name': receiver['name'],
+            'receiver_wish': receiver['wish'],
+            'receiver_not_wish': receiver['not_wish'],
+            'notified': giver['notified']
         }
 
 # Создаём базу данных
@@ -136,12 +171,16 @@ db = SantaDatabase()
 
 # ========== ОСНОВНЫЕ ФУНКЦИИ ==========
 
+def is_admin(user_id):
+    """Проверка, является ли пользователь администратором"""
+    return user_id == ADMIN_ID
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало работы с ботом"""
     user = update.effective_user
     
     if db.is_registered(user.id):
-        await show_main_menu(update)
+        await show_user_menu(update, user.id)
     else:
         await update.message.reply_text(
             f"Привет, {user.first_name}! 🎅\n\n"
@@ -151,13 +190,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['reg_step'] = WAITING_FOR_NAME
 
-async def show_main_menu(update: Update):
-    """Показать главное меню с кнопками"""
+async def show_user_menu(update: Update, user_id):
+    """Показать меню для обычного пользователя"""
     keyboard = [
         ['📝 Моя анкета'],
-        ['🎁 Узнать кому дарить'],
-        ['📊 Статистика']
+        ['🎁 Кому я дарю подарок?']
     ]
+    
+    # Добавляем админские кнопки если пользователь - админ
+    if is_admin(user_id):
+        keyboard.append(['👑 Админ панель'])
+    
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
         "🎄 **Главное меню** 🎄\n\n"
@@ -165,10 +208,36 @@ async def show_main_menu(update: Update):
         reply_markup=reply_markup
     )
 
+async def show_admin_menu(update: Update):
+    """Показать админскую панель"""
+    stats = db.get_stats()
+    
+    keyboard = [
+        ['📊 Статистика'],
+        ['🎁 Распределить подарки'],
+        ['🔔 Отправить уведомления'],
+        ['🔄 Сбросить всё'],
+        ['👤 Вернуться в меню']
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    status_text = "⏳ Ожидание" if not db.distribution_done else "✅ Выполнено"
+    
+    await update.message.reply_text(
+        f"👑 **Админ панель** 👑\n\n"
+        f"📈 Статистика:\n"
+        f"• Участников: {stats['total']}\n"
+        f"• Распределение: {status_text}\n"
+        f"• Получили уведомления: {stats['notified']}/{stats['total']}\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup
+    )
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка всех сообщений"""
     user = update.effective_user
     text = update.message.text
+    user_id = user.id
     
     # Если пользователь в процессе регистрации
     if 'reg_step' in context.user_data:
@@ -203,7 +272,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Сохраняем в базу
             success = db.register(
-                user_id=user.id,
+                user_id=user_id,
                 username=user.username,
                 full_name=full_name,
                 wish=wish,
@@ -214,186 +283,389 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"✅ **Регистрация завершена!** 🎉\n\n"
                     f"Добро пожаловать, {full_name}!\n\n"
-                    "Теперь ты можешь узнать, кому дарить подарок.\n"
-                    "⚠️ **Внимание:**\n"
-                    "• Получатель назначается ОДИН раз\n"
-                    "• Изменить нельзя\n"
-                    "• Каждый получит уникального человека\n"
-                    "• Распределение происходит когда все зарегистрируются"
+                    "Теперь жди, когда организатор распределит подарки.\n"
+                    "Ты получишь сообщение, кому дарить подарок."
                 )
-                await show_main_menu(update)
+                await show_user_menu(update, user_id)
                 context.user_data.clear()
+                
+                # Уведомляем администратора о новом участнике
+                if is_admin(ADMIN_ID):
+                    try:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=f"📥 Новый участник: {full_name}\n"
+                                 f"Всего участников: {len(db.get_all())}"
+                        )
+                    except:
+                        pass
             else:
                 await update.message.reply_text("❌ Ошибка при регистрации")
         return
     
-    # Обработка кнопок меню
+    # Обработка кнопок пользователя
     if text == '📝 Моя анкета':
-        info = db.get_info(user.id)
+        info = db.get_info(user_id)
         if info:
             full_name, wish, not_wish = info
             response = f"👤 **Ваша анкета:**\n\n📝 ФИО: {full_name}\n"
             if wish:
                 response += f"✅ Хочет: {wish}\n"
             if not_wish:
-                response += f"❌ Не хочет: {not_wish}"
+                response += f"❌ Не хочет: {not_wish}\n"
+            
+            # Показываем статус распределения
+            if db.distribution_done:
+                if db.is_notified(user_id):
+                    response += "\n📬 Вы уже получили информацию о получателе!"
+                else:
+                    response += "\n⏳ Распределение выполнено, ждите уведомление!"
+            else:
+                response += "\n⏳ Распределение ещё не выполнено"
+            
             await update.message.reply_text(response)
         else:
             await update.message.reply_text("❌ Вы не зарегистрированы. Напишите /start")
     
-    elif text == '🎁 Узнать кому дарить':
-        if not db.is_registered(user.id):
+    elif text == '🎁 Кому я дарю подарок?':
+        if not db.is_registered(user_id):
             await update.message.reply_text("❌ Сначала зарегистрируйтесь через /start")
             return
         
-        # Проверяем общее количество участников
-        stats = db.get_stats()
-        
-        if stats['total'] < 2:
+        if not db.distribution_done:
             await update.message.reply_text(
-                "🎄 **Нужно больше участников!**\n\n"
-                f"Сейчас зарегистрировано: {stats['total']} человек\n"
-                "Минимум нужно: 2 человека\n\n"
-                "Пригласите друзей!"
+                "🎄 **Распределение ещё не выполнено.**\n\n"
+                "Организатор ещё не распределил подарки.\n"
+                "Пожалуйста, подождите."
             )
             return
         
-        # Проверяем, не назначен ли уже получатель
-        existing = db.get_assigned_receiver(user.id)
-        
-        if existing:
-            full_name, wish, not_wish = existing
-            response = f"🎅 **Ваш Тайный Санта уже назначен!**\n\n"
-            response += f"👤 **Вы дарите подарок:** {full_name}\n"
-            
-            if wish:
-                response += f"\n✅ **Что хочет получить:**\n{wish}\n"
-            
-            if not_wish:
-                response += f"\n❌ **Что НЕ хочет получать:**\n{not_wish}\n"
-            
-            response += "\n🎄 **Счастливого Нового года!** 🎄"
-            
-            await update.message.reply_text(response)
+        # Проверяем, получал ли уже пользователь уведомление
+        if db.is_notified(user_id):
+            # Показываем информацию ещё раз
+            receiver_info = db.get_receiver_for_giver(user_id)
+            if receiver_info:
+                receiver_id, full_name, wish, not_wish = receiver_info
+                await send_gift_info(update, user_id, full_name, wish, not_wish)
+            else:
+                await update.message.reply_text("❌ Информация о получателе не найдена")
             return
         
-        # Проверяем, все ли зарегистрировались
-        # Можно добавить логику, что распределение происходит когда все зарегистрировались
-        # Или распределять сразу
-        
-        # Назначаем получателя
-        receiver_info = db.assign_receiver(user.id)
+        # Получаем информацию о получателе
+        receiver_info = db.get_receiver_for_giver(user_id)
         
         if not receiver_info:
             await update.message.reply_text(
-                "🎄 **Распределение ещё не завершено.**\n\n"
-                "Возможно:\n"
-                "• Ещё не все зарегистрировались\n"
-                "• Идёт процесс распределения\n\n"
-                "Попробуйте через минуту!"
+                "❌ Вам ещё не назначен получатель.\n"
+                "Обратитесь к организатору."
             )
             return
         
         receiver_id, full_name, wish, not_wish = receiver_info
         
-        response = f"🎅 **Ваш Тайный Санта назначен!** 🎅\n\n"
-        response += f"👤 **Вы дарите подарок:** {full_name}\n"
+        # Отправляем информацию
+        await send_gift_info(update, user_id, full_name, wish, not_wish)
         
-        if wish:
-            response += f"\n✅ **Что хочет получить:**\n{wish}\n"
+        # Помечаем как уведомлённого
+        db.mark_as_notified(user_id)
         
-        if not_wish:
-            response += f"\n❌ **Что НЕ хочет получать:**\n{not_wish}\n"
-        
-        response += "\n⚠️ **Важно:**\n"
-        response += "• Этот выбор окончательный\n"
-        response += "• Изменить получателя нельзя\n"
-        response += "• Сохраните это сообщение\n\n"
-        response += "🎄 **Счастливого Нового года!** 🎄"
-        
-        await update.message.reply_text(response)
+        # Уведомляем администратора
+        if is_admin(ADMIN_ID):
+            try:
+                user_data = db.get_all().get(user_id, {})
+                user_name = user_data.get('name', 'Неизвестно')
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"✅ {user_name} получил информацию о получателе\n"
+                         f"Получатель: {full_name}"
+                )
+            except:
+                pass
     
-    elif text == '📊 Статистика':
-        stats = db.get_stats()
-        participants = db.get_all()
-        
-        if not participants:
-            await update.message.reply_text("📊 Пока нет участников")
+    # Админские кнопки
+    elif text == '👑 Админ панель':
+        if not is_admin(user_id):
+            await update.message.reply_text("❌ У вас нет доступа к админ панели")
             return
+        await show_admin_menu(update)
+    
+    elif text == '👤 Вернуться в меню':
+        await show_user_menu(update, user_id)
+    
+    # Админские функции
+    elif is_admin(user_id):
+        if text == '📊 Статистика':
+            await show_admin_statistics(update, context)
         
-        response = f"📊 **Статистика:**\n\n"
-        response += f"👥 Всего участников: {stats['total']}\n"
-        response += f"🎁 Имеют дарителя: {stats['with_receiver']}\n"
-        response += f"🎅 Являются дарителями: {stats['is_giver']}\n"
-        response += f"📋 Распределение: {'✅ Завершено' if stats['all_assigned'] else '⏳ В процессе'}\n\n"
+        elif text == '🎁 Распределить подарки':
+            await distribute_gifts(update, context)
         
-        response += "**Участники:**\n"
-        for pid, data in participants.items():
-            status = "🎁" if data['has_receiver'] else "⏳"
-            status += "🎅" if data['is_giver'] else "⏳"
-            response += f"{status} {data['name']}\n"
+        elif text == '🔔 Отправить уведомления':
+            await send_notifications_to_all(update, context)
         
-        await update.message.reply_text(response)
+        elif text == '🔄 Сбросить всё':
+            await reset_all_data(update, context)
     
     else:
         await update.message.reply_text(
             "🤔 Используйте кнопки меню или напишите /start"
         )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда помощи"""
-    await update.message.reply_text(
-        "🎅 **Помощь по боту:**\n\n"
-        "**Как это работает:**\n"
-        "1. Регистрируетесь с ФИО через /start\n"
-        "2. Указываете что хотите/не хотите получать\n"
-        "3. Нажимаете 'Узнать кому дарить'\n"
-        "4. Получаете ОДНОГО уникального человека\n"
-        "5. Дарите ему подарок!\n\n"
-        "**Важные правила:**\n"
-        "• Каждому назначается ОДИН получатель\n"
-        "• Каждый получает ОДНОГО дарителя\n"
-        "• Изменить получателя НЕЛЬЗЯ\n"
-        "• Все участники распределяются в ЦЕПОЧКУ\n"
-        "• Никто не останется без пары!\n\n"
-        "**Команды:**\n"
-        "/start - регистрация\n"
-        "/help - эта справка\n"
-        "/reset - сбросить всё (админ)\n"
-        "/distribute - распределить всех (админ)"
-    )
+async def send_gift_info(update: Update, user_id: int, receiver_name: str, wish: str, not_wish: str):
+    """Отправить информацию о получателе подарка"""
+    response = f"🎅 **Твой Тайный Санта назначен!** 🎅\n\n"
+    response += f"👤 **Ты даришь подарок:** {receiver_name}\n"
+    
+    if wish:
+        response += f"\n✅ **Что хочет получить:**\n{wish}\n"
+    
+    if not_wish:
+        response += f"\n❌ **Что НЕ хочет получать:**\n{not_wish}\n"
+    
+    response += "\n⚠️ **Важно:**\n"
+    response += "• Этот выбор окончательный\n"
+    response += "• Изменить получателя нельзя\n"
+    response += "• Сохраните это сообщение\n\n"
+    response += "🎄 **Счастливого Нового года!** 🎄"
+    
+    await update.message.reply_text(response)
 
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбросить все назначения"""
-    success = db.reset_all()
-    if success:
-        await update.message.reply_text("✅ Все назначения сброшены! Можно начинать заново.")
-    else:
-        await update.message.reply_text("❌ Ошибка при сбросе")
+async def show_admin_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать детальную статистику для админа"""
+    stats = db.get_stats()
+    participants = db.get_all()
+    
+    response = f"📊 **Детальная статистика:**\n\n"
+    response += f"👥 Всего участников: {stats['total']}\n"
+    response += f"🎁 Распределение: {'✅ Выполнено' if db.distribution_done else '❌ Не выполнено'}\n"
+    response += f"🔔 Получили уведомления: {stats['notified']}/{stats['total']}\n\n"
+    
+    if participants:
+        response += "**Список участников:**\n"
+        for user_id, data in participants.items():
+            status = "🔔" if data['notified'] else "⏳"
+            status += "🎁" if data['is_giver'] else ""
+            username = f"(@{data['username']})" if data['username'] else ""
+            response += f"{status} {data['name']} {username}\n"
+    
+    # Информация о парах если распределение выполнено
+    if db.distribution_done:
+        response += "\n**Пары (кто → кому):**\n"
+        for giver_id, receiver_id in db.pairs.items():
+            giver = participants.get(giver_id, {})
+            receiver = participants.get(receiver_id, {})
+            notified = "✅" if giver.get('notified') else "⏳"
+            response += f"{notified} {giver.get('name', '?')} → {receiver.get('name', '?')}\n"
+    
+    await update.message.reply_text(response)
 
-async def distribute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительно распределить всех"""
+async def distribute_gifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Распределить подарки между всеми участниками"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администратора!")
+        return
+    
     stats = db.get_stats()
     
     if stats['total'] < 2:
         await update.message.reply_text("❌ Нужно минимум 2 участника для распределения")
         return
     
-    success = db.ensure_all_assigned()
+    if db.distribution_done:
+        await update.message.reply_text("⚠️ Распределение уже выполнено!\nИспользуйте 'Сбросить всё' чтобы начать заново.")
+        return
     
-    if success:
-        await update.message.reply_text(
-            f"✅ Все {stats['total']} участников распределены!\n\n"
-            "Теперь каждый может узнать, кому дарить подарок."
+    # Запрашиваем подтверждение
+    keyboard = [['✅ Да, распределить', '❌ Нет, отмена']]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        f"⚠️ **Подтверждение распределения** ⚠️\n\n"
+        f"Вы собираетесь распределить подарки между {stats['total']} участниками.\n\n"
+        f"После этого:\n"
+        f"• Каждому будет назначен получатель\n"
+        f"• Изменить распределение будет нельзя\n"
+        f"• Участники смогут узнать кому дарить\n\n"
+        f"Вы уверены?",
+        reply_markup=reply_markup
+    )
+    
+    context.user_data['awaiting_distribution_confirmation'] = True
+
+async def send_notifications_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправить уведомления всем участникам"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администратора!")
+        return
+    
+    if not db.distribution_done:
+        await update.message.reply_text("❌ Сначала выполните распределение подарков!")
+        return
+    
+    participants = db.get_all()
+    total = len(participants)
+    sent = 0
+    failed = 0
+    
+    await update.message.reply_text(f"⏳ Отправляю уведомления {total} участникам...")
+    
+    for user_id, data in participants.items():
+        if not data['notified']:
+            receiver_info = db.get_receiver_for_giver(user_id)
+            if receiver_info:
+                receiver_id, full_name, wish, not_wish = receiver_info
+                
+                try:
+                    # Отправляем сообщение участнику
+                    message = f"🎅 **Твой Тайный Санта назначен!** 🎅\n\n"
+                    message += f"👤 **Ты даришь подарок:** {full_name}\n"
+                    
+                    if wish:
+                        message += f"\n✅ **Что хочет получить:**\n{wish}\n"
+                    
+                    if not_wish:
+                        message += f"\n❌ **Что НЕ хочет получать:**\n{not_wish}\n"
+                    
+                    message += "\n🎄 **Счастливого Нового года!** 🎄"
+                    
+                    await context.bot.send_message(chat_id=user_id, text=message)
+                    
+                    # Помечаем как уведомлённого
+                    db.mark_as_notified(user_id)
+                    sent += 1
+                    
+                    # Небольшая задержка чтобы не спамить
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка отправки {user_id}: {e}")
+                    failed += 1
+    
+    await update.message.reply_text(
+        f"✅ Уведомления отправлены!\n\n"
+        f"• Успешно: {sent}\n"
+        f"• Ошибок: {failed}\n"
+        f"• Всего участников: {total}"
+    )
+
+async def reset_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбросить все данные"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администратора!")
+        return
+    
+    # Запрашиваем подтверждение
+    keyboard = [['✅ Да, сбросить всё', '❌ Нет, отмена']]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        "⚠️ **ВНИМАНИЕ!** ⚠️\n\n"
+        "Вы собираетесь сбросить ВСЕ данные:\n"
+        "• Всех участников\n"
+        "• Все назначения\n"
+        "• Всю историю\n\n"
+        "Это действие НЕЛЬЗЯ отменить!\n"
+        "Вы уверены?",
+        reply_markup=reply_markup
+    )
+    
+    context.user_data['awaiting_reset_confirmation'] = True
+
+# ========== КОМАНДЫ ==========
+
+async def handle_admin_confirmations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка подтверждений для администратора"""
+    user = update.effective_user
+    text = update.message.text
+    
+    if not is_admin(user.id):
+        return
+    
+    # Подтверждение распределения
+    if context.user_data.get('awaiting_distribution_confirmation'):
+        if text == '✅ Да, распределить':
+            success = db.distribute_gifts()
+            
+            if success:
+                stats = db.get_stats()
+                await update.message.reply_text(
+                    f"✅ **Распределение выполнено успешно!**\n\n"
+                    f"🎁 Распределено между {stats['total']} участниками\n\n"
+                    f"Теперь участники могут:\n"
+                    f"1. Нажать 'Кому я дарю подарок?' чтобы узнать\n"
+                    f"2. Или вы можете отправить уведомления всем"
+                )
+                await show_admin_menu(update)
+            else:
+                await update.message.reply_text("❌ Ошибка при распределении")
+        
+        elif text == '❌ Нет, отмена':
+            await update.message.reply_text("❌ Распределение отменено")
+            await show_admin_menu(update)
+        
+        context.user_data.pop('awaiting_distribution_confirmation', None)
+    
+    # Подтверждение сброса
+    elif context.user_data.get('awaiting_reset_confirmation'):
+        if text == '✅ Да, сбросить всё':
+            db.reset_all()
+            await update.message.reply_text(
+                "✅ **Все данные успешно сброшены!**\n\n"
+                "База данных очищена.\n"
+                "Теперь можно начинать новый розыгрыш с чистого листа."
+            )
+            await show_admin_menu(update)
+        
+        elif text == '❌ Нет, отмена':
+            await update.message.reply_text("❌ Сброс отменён")
+            await show_admin_menu(update)
+        
+        context.user_data.pop('awaiting_reset_confirmation', None)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда помощи"""
+    user = update.effective_user
+    
+    if is_admin(user.id):
+        help_text = (
+            "👑 **Админ команды:**\n\n"
+            "/start - регистрация/меню\n"
+            "/stats - статистика\n"
+            "/distribute - распределить подарки\n"
+            "/notify_all - уведомить всех\n"
+            "/reset - сбросить всё\n"
+            "/help - эта справка"
         )
     else:
-        await update.message.reply_text("❌ Ошибка при распределении")
+        help_text = (
+            "🎅 **Помощь по боту:**\n\n"
+            "**Как это работает:**\n"
+            "1. Регистрируетесь с ФИО через /start\n"
+            "2. Указываете что хотите/не хотите получать\n"
+            "3. Ждёте когда организатор распределит подарки\n"
+            "4. Получаете уведомление кому дарить\n"
+            "5. Дарите подарок!\n\n"
+            "**Команды:**\n"
+            "/start - регистрация\n"
+            "/help - эта справка"
+        )
+    
+    await update.message.reply_text(help_text)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда статистики"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администратора!")
+        return
+    
+    await show_admin_statistics(update, context)
 
 # ========== ЗАПУСК БОТА ==========
 
 async def main():
     """Асинхронная главная функция"""
     print("🤖 Запускаю бота...")
+    print(f"👑 Администратор: {ADMIN_ID}")
     
     # Проверяем токен
     if not TOKEN:
@@ -408,11 +680,18 @@ async def main():
         .connect_timeout(30) \
         .build()
     
-    # Регистрируем обработчики
+    # Регистрируем обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("reset", reset_command))
-    application.add_handler(CommandHandler("distribute", distribute_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    
+    # Обработчик для админских подтверждений
+    application.add_handler(MessageHandler(
+        filters.Regex(r'^(✅ Да, распределить|❌ Нет, отмена|✅ Да, сбросить всё)$'),
+        handle_admin_confirmations
+    ))
+    
+    # Главный обработчик сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("✅ Бот запущен и готов к работе!")
@@ -447,5 +726,8 @@ async def main():
         print("🛑 Бот остановлен")
 
 if __name__ == '__main__':
-    import asyncio
+    # Добавляем обработку асинхронных ошибок
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     asyncio.run(main())
