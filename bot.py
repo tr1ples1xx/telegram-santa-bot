@@ -1,20 +1,96 @@
 import logging
 import os
+import sys
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-from database import SantaDatabase
+from telegram.error import Conflict
 
 # Токен
 TOKEN = os.environ.get('BOT_TOKEN') or '7910806794:AAEJUGA9xhGuWnFUnGukfHSLP71JNSFfqX8'
 
-db = SantaDatabase()
-
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    stream=sys.stdout  # Важно для Railway!
 )
 logger = logging.getLogger(__name__)
+
+# Простая база данных в памяти (вместо SQLite)
+class SimpleDatabase:
+    def __init__(self):
+        self.participants = {}  # user_id -> {name, wish, not_wish, has_receiver}
+        self.pairs = {}  # giver_id -> receiver_id
+        self.used_receivers = set()  # Кому уже назначили дарителя
+    
+    def register(self, user_id, username, full_name, wish=None, not_wish=None):
+        self.participants[user_id] = {
+            'name': full_name,
+            'wish': wish,
+            'not_wish': not_wish,
+            'has_receiver': False
+        }
+        logger.info(f"Registered: {full_name}")
+        return True
+    
+    def is_registered(self, user_id):
+        return user_id in self.participants
+    
+    def get_info(self, user_id):
+        if user_id in self.participants:
+            p = self.participants[user_id]
+            return (p['name'], p['wish'], p['not_wish'])
+        return None
+    
+    def assign_receiver(self, giver_id):
+        # Проверяем, не назначен ли уже получатель
+        if giver_id in self.pairs:
+            receiver_id = self.pairs[giver_id]
+            p = self.participants.get(receiver_id)
+            if p:
+                return (receiver_id, p['name'], p['wish'], p['not_wish'])
+            return None
+        
+        # Ищем доступного получателя
+        available = []
+        for uid, data in self.participants.items():
+            if uid != giver_id and not data['has_receiver'] and uid not in self.used_receivers:
+                available.append((uid, data))
+        
+        if not available:
+            return None
+        
+        import random
+        receiver_id, receiver_data = random.choice(available)
+        
+        # Сохраняем пару
+        self.pairs[giver_id] = receiver_id
+        self.participants[receiver_id]['has_receiver'] = True
+        self.used_receivers.add(receiver_id)
+        
+        logger.info(f"Assigned: {giver_id} -> {receiver_id}")
+        return (receiver_id, receiver_data['name'], receiver_data['wish'], receiver_data['not_wish'])
+    
+    def get_assigned_receiver(self, giver_id):
+        if giver_id in self.pairs:
+            receiver_id = self.pairs[giver_id]
+            p = self.participants.get(receiver_id)
+            if p:
+                return (p['name'], p['wish'], p['not_wish'])
+        return None
+    
+    def reset_all(self):
+        self.pairs.clear()
+        self.used_receivers.clear()
+        for uid in self.participants:
+            self.participants[uid]['has_receiver'] = False
+        return True
+    
+    def get_all(self):
+        return self.participants
+
+# Создаём базу данных
+db = SimpleDatabase()
 
 # Состояния для регистрации
 (WAITING_FOR_NAME, WAITING_FOR_WISH, WAITING_FOR_NOT_WISH) = range(3)
@@ -60,7 +136,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         step = context.user_data['reg_step']
         
         if step == WAITING_FOR_NAME:
-            # Получили ФИО
             if len(text) < 5:
                 await update.message.reply_text("❌ Слишком короткое ФИО. Напишите полностью.")
                 return
@@ -73,7 +148,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['reg_step'] = WAITING_FOR_WISH
             
         elif step == WAITING_FOR_WISH:
-            # Получили пожелание
             wish = None if text.lower() == 'нет' else text
             context.user_data['wish'] = wish
             
@@ -84,18 +158,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['reg_step'] = WAITING_FOR_NOT_WISH
             
         elif step == WAITING_FOR_NOT_WISH:
-            # Получили "не хочу"
             not_wish = None if text.lower() == 'нет' else text
             full_name = context.user_data['full_name']
             wish = context.user_data.get('wish')
             
             # Сохраняем в базу
-            success = db.register_participant(
+            success = db.register(
                 user_id=user.id,
                 username=user.username,
                 full_name=full_name,
-                wish_text=wish,
-                not_wish_text=not_wish
+                wish=wish,
+                not_wish=not_wish
             )
             
             if success:
@@ -109,7 +182,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "• Каждый получит уникального человека"
                 )
                 await show_main_menu(update)
-                # Очищаем временные данные
                 context.user_data.clear()
             else:
                 await update.message.reply_text("❌ Ошибка при регистрации")
@@ -117,7 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Обработка кнопок меню
     if text == '📝 Моя анкета':
-        info = db.get_participant_info(user.id)
+        info = db.get_info(user.id)
         if info:
             full_name, wish, not_wish = info
             response = f"👤 **Ваша анкета:**\n\n📝 ФИО: {full_name}\n"
@@ -135,11 +207,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Проверяем, не назначен ли уже получатель
-        existing_receiver = db.get_assigned_receiver(user.id)
+        existing = db.get_assigned_receiver(user.id)
         
-        if existing_receiver:
-            # Уже есть получатель
-            full_name, wish, not_wish = existing_receiver
+        if existing:
+            full_name, wish, not_wish = existing
             response = f"🎅 **Ваш Тайный Санта уже назначен!**\n\n"
             response += f"👤 **Вы дарите подарок:** {full_name}\n"
             
@@ -170,7 +241,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         receiver_id, full_name, wish, not_wish = receiver_info
         
-        # Формируем сообщение
         response = f"🎅 **Ваш Тайный Санта назначен!** 🎅\n\n"
         response += f"👤 **Вы дарите подарок:** {full_name}\n"
         
@@ -189,14 +259,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     
     elif text == '📊 Статистика':
-        participants = db.get_all_participants()
+        participants = db.get_all()
         
         if not participants:
             await update.message.reply_text("📊 Пока нет участников")
             return
         
         total = len(participants)
-        with_receiver = sum(1 for p in participants if p[7])  # has_receiver поле
+        with_receiver = sum(1 for p in participants.values() if p['has_receiver'])
         
         response = f"📊 **Статистика:**\n\n"
         response += f"👥 Всего участников: {total}\n"
@@ -204,10 +274,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response += f"⏳ Ожидают распределения: {total - with_receiver}\n\n"
         
         response += "**Участники:**\n"
-        for participant in participants:
-            status = "✅" if participant[7] else "⏳"  # has_receiver
-            name = participant[3]  # full_name
-            response += f"{status} {name}\n"
+        for pid, data in participants.items():
+            status = "✅" if data['has_receiver'] else "⏳"
+            response += f"{status} {data['name']}\n"
         
         await update.message.reply_text(response)
     
@@ -234,22 +303,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Команды:**\n"
         "/start - регистрация\n"
         "/help - эта справка\n"
-        "/admin_reset - сбросить всё (админ)"
+        "/reset - сбросить всё (админ)"
     )
 
-async def admin_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбросить все назначения (только для админа)"""
-    # Можно добавить проверку на админа по user.id
-    success = db.reset_all_assignments()
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбросить все назначения"""
+    success = db.reset_all()
     if success:
         await update.message.reply_text("✅ Все назначения сброшены! Можно начинать заново.")
     else:
         await update.message.reply_text("❌ Ошибка при сбросе")
 
-# ========== ЗАПУСК БОТА ==========
+# ========== ЗАПУСК БОТА С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==========
 
-def main():
-    """Главная функция запуска"""
+async def main():
+    """Асинхронная главная функция"""
     print("🤖 Запускаю бота...")
     
     # Проверяем токен
@@ -257,20 +325,54 @@ def main():
         print("❌ Токен не найден!")
         return
     
-    # Создаём приложение
-    application = Application.builder().token(TOKEN).build()
+    # Создаём приложение с таймаутами
+    application = Application.builder() \
+        .token(TOKEN) \
+        .read_timeout(30) \
+        .write_timeout(30) \
+        .connect_timeout(30) \
+        .build()
     
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("admin_reset", admin_reset_command))
+    application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("✅ Бот запущен и готов к работе!")
     print("🔗 Бот будет работать 24/7 на Railway")
     
-    # Запускаем бота
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # Запускаем бота с обработкой конфликтов
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(
+            drop_pending_updates=True,  # Важно! Игнорировать старые сообщения
+            timeout=30,
+            poll_interval=1.0
+        )
+        
+        # Бесконечный цикл с обработкой остановки
+        await asyncio.Event().wait()
+        
+    except Conflict as e:
+        print(f"⚠️ ОШИБКА: Бот уже запущен в другом месте!")
+        print(f"Сообщение: {e}")
+        print("Решение: Подождите 2 минуты или перезапустите проект на Railway")
+        
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {type(e).__name__}: {e}")
+        
+    finally:
+        # Корректная остановка
+        if application.updater:
+            await application.updater.stop()
+        if application.running:
+            await application.stop()
+        if application.initialized:
+            await application.shutdown()
+        print("🛑 Бот остановлен")
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())
