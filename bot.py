@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import random
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Conflict
@@ -12,25 +13,26 @@ TOKEN = os.environ.get('BOT_TOKEN') or '7910806794:AAEJUGA9xhGuWnFUnGukfHSLP71JN
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    stream=sys.stdout  # Важно для Railway!
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
-# Простая база данных в памяти (вместо SQLite)
-class SimpleDatabase:
+class SantaDatabase:
     def __init__(self):
-        self.participants = {}  # user_id -> {name, wish, not_wish, has_receiver}
+        self.participants = {}  # user_id -> данные
         self.pairs = {}  # giver_id -> receiver_id
-        self.used_receivers = set()  # Кому уже назначили дарителя
+        self.all_assigned = False  # Флаг полного распределения
     
     def register(self, user_id, username, full_name, wish=None, not_wish=None):
         self.participants[user_id] = {
             'name': full_name,
             'wish': wish,
             'not_wish': not_wish,
-            'has_receiver': False
+            'has_receiver': False,  # Есть ли у этого человека даритель
+            'is_giver': False       # Является ли дарителем кому-то
         }
         logger.info(f"Registered: {full_name}")
+        self.all_assigned = False  # Сброс распределения при новом участнике
         return True
     
     def is_registered(self, user_id):
@@ -42,55 +44,92 @@ class SimpleDatabase:
             return (p['name'], p['wish'], p['not_wish'])
         return None
     
+    def ensure_all_assigned(self):
+        """Гарантирует полное распределение всех участников"""
+        if self.all_assigned:
+            return True
+        
+        participants_list = list(self.participants.keys())
+        
+        if len(participants_list) < 2:
+            return False
+        
+        # Создаём случайную циклическую цепочку
+        shuffled = participants_list.copy()
+        random.shuffle(shuffled)
+        
+        # Создаём цикл: каждый дарит следующему
+        self.pairs.clear()
+        for i in range(len(shuffled)):
+            giver = shuffled[i]
+            receiver = shuffled[(i + 1) % len(shuffled)]  # Замыкаем в цикл
+            self.pairs[giver] = receiver
+        
+        # Обновляем статусы
+        for user_id in self.participants:
+            self.participants[user_id]['has_receiver'] = user_id in self.pairs.values()
+            self.participants[user_id]['is_giver'] = user_id in self.pairs
+        
+        self.all_assigned = True
+        logger.info(f"Created distribution chain for {len(participants_list)} participants")
+        return True
+    
     def assign_receiver(self, giver_id):
-        # Проверяем, не назначен ли уже получатель
-        if giver_id in self.pairs:
-            receiver_id = self.pairs[giver_id]
-            p = self.participants.get(receiver_id)
-            if p:
-                return (receiver_id, p['name'], p['wish'], p['not_wish'])
+        """Получить назначенного получателя"""
+        # Гарантируем полное распределение
+        if not self.ensure_all_assigned():
             return None
         
-        # Ищем доступного получателя
-        available = []
-        for uid, data in self.participants.items():
-            if uid != giver_id and not data['has_receiver'] and uid not in self.used_receivers:
-                available.append((uid, data))
-        
-        if not available:
+        if giver_id not in self.pairs:
             return None
         
-        import random
-        receiver_id, receiver_data = random.choice(available)
+        receiver_id = self.pairs[giver_id]
+        receiver = self.participants.get(receiver_id)
         
-        # Сохраняем пару
-        self.pairs[giver_id] = receiver_id
-        self.participants[receiver_id]['has_receiver'] = True
-        self.used_receivers.add(receiver_id)
+        if not receiver:
+            return None
         
-        logger.info(f"Assigned: {giver_id} -> {receiver_id}")
-        return (receiver_id, receiver_data['name'], receiver_data['wish'], receiver_data['not_wish'])
+        return (receiver_id, receiver['name'], receiver['wish'], receiver['not_wish'])
     
     def get_assigned_receiver(self, giver_id):
-        if giver_id in self.pairs:
-            receiver_id = self.pairs[giver_id]
-            p = self.participants.get(receiver_id)
-            if p:
-                return (p['name'], p['wish'], p['not_wish'])
-        return None
+        """Получить уже назначенного получателя (для отображения)"""
+        if giver_id not in self.pairs:
+            return None
+        
+        receiver_id = self.pairs[giver_id]
+        receiver = self.participants.get(receiver_id)
+        
+        if not receiver:
+            return None
+        
+        return (receiver['name'], receiver['wish'], receiver['not_wish'])
     
     def reset_all(self):
         self.pairs.clear()
-        self.used_receivers.clear()
+        self.all_assigned = False
         for uid in self.participants:
             self.participants[uid]['has_receiver'] = False
+            self.participants[uid]['is_giver'] = False
         return True
     
     def get_all(self):
         return self.participants
+    
+    def get_stats(self):
+        """Статистика распределения"""
+        total = len(self.participants)
+        with_receiver = sum(1 for p in self.participants.values() if p['has_receiver'])
+        is_giver = sum(1 for p in self.participants.values() if p['is_giver'])
+        
+        return {
+            'total': total,
+            'with_receiver': with_receiver,
+            'is_giver': is_giver,
+            'all_assigned': self.all_assigned
+        }
 
 # Создаём базу данных
-db = SimpleDatabase()
+db = SantaDatabase()
 
 # Состояния для регистрации
 (WAITING_FOR_NAME, WAITING_FOR_WISH, WAITING_FOR_NOT_WISH) = range(3)
@@ -179,7 +218,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "⚠️ **Внимание:**\n"
                     "• Получатель назначается ОДИН раз\n"
                     "• Изменить нельзя\n"
-                    "• Каждый получит уникального человека"
+                    "• Каждый получит уникального человека\n"
+                    "• Распределение происходит когда все зарегистрируются"
                 )
                 await show_main_menu(update)
                 context.user_data.clear()
@@ -206,6 +246,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Сначала зарегистрируйтесь через /start")
             return
         
+        # Проверяем общее количество участников
+        stats = db.get_stats()
+        
+        if stats['total'] < 2:
+            await update.message.reply_text(
+                "🎄 **Нужно больше участников!**\n\n"
+                f"Сейчас зарегистрировано: {stats['total']} человек\n"
+                "Минимум нужно: 2 человека\n\n"
+                "Пригласите друзей!"
+            )
+            return
+        
         # Проверяем, не назначен ли уже получатель
         existing = db.get_assigned_receiver(user.id)
         
@@ -225,17 +277,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response)
             return
         
-        # Назначаем нового получателя
+        # Проверяем, все ли зарегистрировались
+        # Можно добавить логику, что распределение происходит когда все зарегистрировались
+        # Или распределять сразу
+        
+        # Назначаем получателя
         receiver_info = db.assign_receiver(user.id)
         
         if not receiver_info:
             await update.message.reply_text(
-                "🎄 **Пока нет доступных получателей.**\n\n"
+                "🎄 **Распределение ещё не завершено.**\n\n"
                 "Возможно:\n"
-                "• Все участники уже распределены\n"
-                "• Недостаточно участников (нужно минимум 2)\n"
-                "• Подождите пока другие зарегистрируются\n\n"
-                "Проверьте позже!"
+                "• Ещё не все зарегистрировались\n"
+                "• Идёт процесс распределения\n\n"
+                "Попробуйте через минуту!"
             )
             return
         
@@ -259,23 +314,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     
     elif text == '📊 Статистика':
+        stats = db.get_stats()
         participants = db.get_all()
         
         if not participants:
             await update.message.reply_text("📊 Пока нет участников")
             return
         
-        total = len(participants)
-        with_receiver = sum(1 for p in participants.values() if p['has_receiver'])
-        
         response = f"📊 **Статистика:**\n\n"
-        response += f"👥 Всего участников: {total}\n"
-        response += f"🎁 Распределено подарков: {with_receiver}\n"
-        response += f"⏳ Ожидают распределения: {total - with_receiver}\n\n"
+        response += f"👥 Всего участников: {stats['total']}\n"
+        response += f"🎁 Имеют дарителя: {stats['with_receiver']}\n"
+        response += f"🎅 Являются дарителями: {stats['is_giver']}\n"
+        response += f"📋 Распределение: {'✅ Завершено' if stats['all_assigned'] else '⏳ В процессе'}\n\n"
         
         response += "**Участники:**\n"
         for pid, data in participants.items():
-            status = "✅" if data['has_receiver'] else "⏳"
+            status = "🎁" if data['has_receiver'] else "⏳"
+            status += "🎅" if data['is_giver'] else "⏳"
             response += f"{status} {data['name']}\n"
         
         await update.message.reply_text(response)
@@ -299,11 +354,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Каждому назначается ОДИН получатель\n"
         "• Каждый получает ОДНОГО дарителя\n"
         "• Изменить получателя НЕЛЬЗЯ\n"
-        "• Никто не получит два подарка\n\n"
+        "• Все участники распределяются в ЦЕПОЧКУ\n"
+        "• Никто не останется без пары!\n\n"
         "**Команды:**\n"
         "/start - регистрация\n"
         "/help - эта справка\n"
-        "/reset - сбросить всё (админ)"
+        "/reset - сбросить всё (админ)\n"
+        "/distribute - распределить всех (админ)"
     )
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,7 +371,25 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Ошибка при сбросе")
 
-# ========== ЗАПУСК БОТА С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==========
+async def distribute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно распределить всех"""
+    stats = db.get_stats()
+    
+    if stats['total'] < 2:
+        await update.message.reply_text("❌ Нужно минимум 2 участника для распределения")
+        return
+    
+    success = db.ensure_all_assigned()
+    
+    if success:
+        await update.message.reply_text(
+            f"✅ Все {stats['total']} участников распределены!\n\n"
+            "Теперь каждый может узнать, кому дарить подарок."
+        )
+    else:
+        await update.message.reply_text("❌ Ошибка при распределении")
+
+# ========== ЗАПУСК БОТА ==========
 
 async def main():
     """Асинхронная главная функция"""
@@ -325,7 +400,7 @@ async def main():
         print("❌ Токен не найден!")
         return
     
-    # Создаём приложение с таймаутами
+    # Создаём приложение
     application = Application.builder() \
         .token(TOKEN) \
         .read_timeout(30) \
@@ -337,34 +412,32 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("distribute", distribute_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("✅ Бот запущен и готов к работе!")
     print("🔗 Бот будет работать 24/7 на Railway")
     
     try:
-        # Запускаем бота с обработкой конфликтов
+        # Запускаем бота
         await application.initialize()
         await application.start()
         await application.updater.start_polling(
-            drop_pending_updates=True,  # Важно! Игнорировать старые сообщения
+            drop_pending_updates=True,
             timeout=30,
             poll_interval=1.0
         )
         
-        # Бесконечный цикл с обработкой остановки
+        # Бесконечный цикл
         await asyncio.Event().wait()
         
     except Conflict as e:
-        print(f"⚠️ ОШИБКА: Бот уже запущен в другом месте!")
-        print(f"Сообщение: {e}")
-        print("Решение: Подождите 2 минуты или перезапустите проект на Railway")
+        print(f"⚠️ Бот уже запущен: {e}")
         
     except Exception as e:
-        print(f"❌ Критическая ошибка: {type(e).__name__}: {e}")
+        print(f"❌ Ошибка: {type(e).__name__}: {e}")
         
     finally:
-        # Корректная остановка
         if application.updater:
             await application.updater.stop()
         if application.running:
