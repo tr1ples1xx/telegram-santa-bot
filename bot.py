@@ -60,7 +60,7 @@ except:
     db = SimpleDB()
 
 # Токен бота (Railway добавит его сам)
-TOKEN = os.environ.get('BOT_TOKEN', '')
+TOKEN = '7910806794:AAEJUGA9xhGuWnFUnGukfHSLP71JNSFfqX8'
 
 # Настройка логирования
 logging.basicConfig(
@@ -343,4 +343,5 @@ def main():
 
 
 if __name__ == '__main__':
+
     main()
